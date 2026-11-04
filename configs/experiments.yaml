@@ -1,0 +1,8 @@
+# Experiments apply overrides to routes whose key fully matches the regex.
+# `baseline` sends no prompt, phrase list or custom vocabulary (allow_prompts: false is enforced).
+
+experiments:
+  baseline:
+    description: "No prompt, phrase list or vocabulary. Default settings per route."
+    allow_prompts: false
+    overrides: {}
