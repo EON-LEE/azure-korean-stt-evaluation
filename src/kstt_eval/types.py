@@ -97,8 +97,16 @@ class TransientError(AdapterError):
         self.ambiguous = ambiguous
 
 
+class NetworkError(TransientError):
+    """The connection failed before any audio was sent (DNS, TCP, TLS, WebSocket connect)."""
+
+
 class PermanentError(AdapterError):
     """Non-retryable error (bad request, auth, unsupported model/locale)."""
+
+
+class AuthError(AdapterError):
+    """No Entra ID token could be obtained (for example the ``az login`` session expired)."""
 
 
 class ConfigError(Exception):

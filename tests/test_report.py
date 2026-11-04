@@ -121,3 +121,53 @@ def test_score_run_rejects_unknown_items(tmp_path):
     (run / "run.json").write_text(json.dumps(meta), encoding="utf-8")
     with pytest.raises(FileNotFoundError):
         score_run(run, data)
+
+
+def test_latency_excludes_cached_and_invalid_and_counts_failed_final(tmp_path):
+    results = [
+        {"route": "fast-azure", "utt_id": "u1", "status": "ok", "text": "안녕하세요 반갑습니다",
+         "latency": {"request_s": 0.5}},
+        {"route": "fast-azure", "utt_id": "u2", "status": "ok", "text": "오늘 날씨가 좋다",
+         "latency": {"request_s": 90.0}, "latency_invalid": True, "latency_flags": ["clock_gap"]},
+        {"route": "fast-azure", "utt_id": "u3", "status": "ok", "text": "회의는 내일 열린다",
+         "latency": {"request_s": 40.0}, "cached": True},
+        {"route": "rt-b", "utt_id": "u1", "status": "ok", "text": "안녕하세요 반갑습니다",
+         "latency": {"final_after_audio_end_s": 0.3, "audio_send_s": 2.5}, "latency_flags": ["send_delay"]},
+        {"route": "rt-b", "utt_id": "u2", "status": "failed_final", "error": {"message": "HTTP 400"}, "attempts": 2},
+        {"route": "rt-b", "utt_id": "u3", "status": "failed", "error": {"message": "HTTP 500"}, "attempts": 1},
+    ]
+    routes = {"fast-azure": {"track": "A", "model_id": "azure-speech"}, "rt-b": {"track": "B", "model_id": "m-b"}}
+    data, run = _setup(tmp_path, results, routes)
+    meta = json.loads((run / "run.json").read_text(encoding="utf-8"))
+    meta["invocations"] = [{"exit_reason": "pass_done", "blocked_routes": []},
+                           {"exit_reason": "stopped", "blocked_routes": ["rt-b"]}]
+    (run / "run.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    with open(run / "ledger.jsonl", "w", encoding="utf-8") as f:
+        for i, (route, utt) in enumerate([("fast-azure", "u1"), ("rt-b", "u1"), ("rt-b", "u2")]):
+            f.write(json.dumps({"op": "reserve", "id": f"inv:{i}", "route": route, "utt_id": utt,
+                                "audio_s": 1800.0}) + "\n")
+        f.write(json.dumps({"op": "settle", "id": "inv:0", "outcome": "ok"}) + "\n")
+        f.write(json.dumps({"op": "settle", "id": "inv:1", "outcome": "ok"}) + "\n")
+
+    out_dir = tmp_path / "out"
+    out = write_report(run, data, out_dir, baseline="fast-azure", n_boot=50)
+    summ = {(s["route"], s["split"]): s for s in out["summary"]}
+    fa = summ[("fast-azure", "all")]
+    assert fa["scored"] == 3 and fa["latency_n"] == 1 and fa["latency_invalid"] == 1
+    assert fa["latency_p50_s"] == pytest.approx(0.5) and fa["latency_p90_s"] == pytest.approx(0.5)
+    rb = summ[("rt-b", "all")]
+    assert (rb["failed"], rb["failed_final"], rb["scored"]) == (1, 1, 1)
+    assert rb["latency_flagged"] == 1 and rb["send_delay_p95_s"] == pytest.approx(0.5)
+
+    md = (out_dir / "report.md").read_text(encoding="utf-8")
+    assert "실행 횟수: 2회" in md and "`stopped`" in md
+    assert "전송한 오디오(ledger 기준): 1.500시간" in md
+    assert "결과가 기록되지 않은 예약: 1건(0.500시간)" in md
+    assert "차단된 경로: `rt-b`" in md
+    assert "| `rt-b` | 1/3 | 2 |" in md.replace("| B | m-b ", "")
+    assert "| `rt-b` | u2 | failed_final | 2 |" in md
+    assert "시계 이상 구간의 결과 1건" in md
+    with open(out_dir / "per_utterance.csv", encoding="utf-8-sig", newline="") as f:
+        rows = {(r["route"], r["utt_id"]): r for r in csv.DictReader(f)}
+    assert rows[("fast-azure", "u2")]["latency_invalid"] == "True"
+    assert rows[("fast-azure", "u2")]["latency_flags"] == "clock_gap"

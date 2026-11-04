@@ -15,12 +15,12 @@ from .data import load_manifest
 from .metrics import METRICS, bootstrap_ci, corpus_rate, finite_or_none, hangul_stats, paired_bootstrap, percentiles, \
     score_pair
 from .normalize_ko import NORMALIZER_VERSION, normalize
-from .runner import load_results
+from .runner import ledger_summary, load_results
 from .types import ManifestEntry
 from .util import write_json
 
 SCORED = ("ok", "empty")
-STATUSES = ("ok", "empty", "failed", "skipped", "missing")
+STATUSES = ("ok", "empty", "failed", "failed_final", "skipped", "missing")
 DEFAULT_BASELINE = "fast-azure"
 LOW_HANGUL_RATIO = 0.5
 # An utterance whose output hangul ratio is this much lower than its reference likely came back in another language.
@@ -71,6 +71,9 @@ def score_run(run_dir: Path, data_dir: Path) -> tuple[dict, list[dict]]:
                 "attempts": rec.get("attempts", 0) if rec else 0,
                 "throttled": rec.get("throttled", 0) if rec else 0,
                 "forced_commit": bool(rec and (rec.get("meta") or {}).get("forced_commit")),
+                "latency_invalid": bool(rec and rec.get("latency_invalid")),
+                "latency_flags": list(rec.get("latency_flags") or []) if rec else [],
+                "send_delay_s": None,
                 "error": (rec.get("error") or {}).get("message") if rec else None,
                 "reason": rec.get("reason") if rec else None,
                 "ref_norm": normalize(entry.reference),
@@ -88,6 +91,8 @@ def score_run(run_dir: Path, data_dir: Path) -> tuple[dict, list[dict]]:
                 row["first_partial_s"] = _lat(lat, "first_partial_s")
                 row["connect_s"] = _lat(lat, "connect_s")
                 row["request_s"] = _lat(lat, "request_s")
+                send = _lat(lat, "audio_send_s")
+                row["send_delay_s"] = None if send is None else send - entry.duration_s
                 row["hangul"], row["letters"] = hangul_stats(text)
                 row["script_mismatch"] = _script_mismatch(row["ref_norm"], text)
             rows.append(row)
@@ -113,11 +118,17 @@ def _aggregate(route: str, split: str, rows: list[dict], spec: dict, n_boot: int
     letters = sum(r["letters"] for r in scored)
     out["hangul_ratio"] = hangul / letters if letters else None
     out["script_mismatch"] = sum(r["script_mismatch"] for r in scored)
-    lat = percentiles(r["latency"] for r in scored)
+    # Cached results carry the latency of an earlier run; latency_invalid spans a sleep/suspend gap.
+    timed = [r for r in scored if not r["cached"] and not r["latency_invalid"]]
+    out["latency_n"] = len(timed)
+    out["latency_invalid"] = sum(r["latency_invalid"] for r in scored)
+    out["latency_flagged"] = sum(bool(r["latency_flags"]) for r in timed)
+    lat = percentiles(r["latency"] for r in timed)
     out["latency_p50_s"], out["latency_p90_s"] = finite_or_none(lat["p50"]), finite_or_none(lat["p90"])
-    out["first_partial_p50_s"] = finite_or_none(percentiles(r["first_partial_s"] for r in scored)["p50"])
-    out["connect_p50_s"] = finite_or_none(percentiles(r["connect_s"] for r in scored)["p50"])
-    rtf = [r["request_s"] / r["duration_s"] for r in scored if r["request_s"] is not None and r["duration_s"] > 0]
+    out["first_partial_p50_s"] = finite_or_none(percentiles(r["first_partial_s"] for r in timed)["p50"])
+    out["connect_p50_s"] = finite_or_none(percentiles(r["connect_s"] for r in timed)["p50"])
+    out["send_delay_p95_s"] = finite_or_none(percentiles((r["send_delay_s"] for r in timed), (95,))["p95"])
+    rtf = [r["request_s"] / r["duration_s"] for r in timed if r["request_s"] is not None and r["duration_s"] > 0]
     out["rtf_p50"] = finite_or_none(percentiles(rtf)["p50"])
     out["cached"] = sum(r["cached"] for r in rows)
     out["throttled"] = sum(r["throttled"] for r in rows)
@@ -193,6 +204,7 @@ def _utterance_rows(rows: list[dict]) -> list[dict]:
             "cer_errors": c["cer"].errors if c else None, "wer_errors": c["wer"].errors if c else None,
             "wer_ref_len": c["wer"].ref_len if c else None,
             "latency_s": r["latency"], "first_partial_s": r["first_partial_s"],
+            "latency_invalid": r["latency_invalid"], "latency_flags": ";".join(r["latency_flags"]),
             "script_mismatch": r["script_mismatch"], "ref_norm": r["ref_norm"], "hyp_norm": r["hyp_norm"], "hyp_raw": r["hyp_raw"],
             "error": r["error"], "reason": r["reason"],
         })
@@ -212,9 +224,11 @@ def _num(v: float | None, digits: int = 2) -> str:
 
 
 def render_markdown(meta: dict, summary: list[dict], comparisons: list[dict], rows: list[dict],
-                    baseline: str) -> str:
+                    baseline: str, health: dict[str, Any] | None = None) -> str:
     items = meta["items"]
     audio_h = meta.get("item_audio_hours")
+    invocations = meta.get("invocations") or []
+    last_inv = invocations[-1] if invocations else {}
     lines = [f"# 한국어 STT 평가 결과: {meta['run_id']}", ""]
     if meta["subset"] != "full":
         lines += [
@@ -228,7 +242,19 @@ def render_markdown(meta: dict, summary: list[dict], comparisons: list[dict], ro
         f"- 정규화: `{meta.get('normalizer', NORMALIZER_VERSION)}`",
         f"- 코드: `{(meta.get('git') or {}).get('commit') or '-'}`"
         + (" (커밋되지 않은 변경 포함)" if (meta.get("git") or {}).get("dirty") else ""),
-        f"- 기준 경로(baseline): `{baseline}`", "",
+        f"- 기준 경로(baseline): `{baseline}`",
+    ]
+    if invocations:
+        lines.append(f"- 실행 횟수: {len(invocations)}회. 마지막 종료 사유: `{last_inv.get('exit_reason') or '-'}`")
+    if health:
+        lines.append(f"- 전송한 오디오(ledger 기준): {health['audio_hours']:.3f}시간")
+        if health.get("unsettled"):
+            lines.append(f"- 결과가 기록되지 않은 예약: {health['unsettled']}건({health['unsettled_audio_hours']:.3f}시간). "
+                         "실행이 끝난 뒤라면 중단된 프로세스가 보낸 요청이다. 사용량에는 포함했다.")
+    if last_inv.get("blocked_routes"):
+        lines.append("- 마지막 실행에서 차단된 경로: " + ", ".join(f"`{r}`" for r in last_inv["blocked_routes"]))
+    lines += [
+        "",
         "## 경로별 결과(전체)", "",
         "sCER은 공백을 제거한 문자 오류율이다. CI는 발화 단위 bootstrap 95% 구간이다. "
         "지연은 Track A에서 요청 시간, Track B에서 음성 끝부터 최종 결과까지의 시간이다. "
@@ -242,7 +268,8 @@ def render_markdown(meta: dict, summary: list[dict], comparisons: list[dict], ro
         ci = "-" if s["scer_ci_low"] is None else f"{_pct(s['scer_ci_low'])}–{_pct(s['scer_ci_high'])}"
         cost = "미설정" if s["est_cost_usd"] is None else f"${s['est_cost_usd']:.4f}"
         lines.append(
-            f"| `{s['route']}` | {s['track']} | {s['model_id'] or '-'} | {s['scored']}/{s['target']} | {s['failed']} | "
+            f"| `{s['route']}` | {s['track']} | {s['model_id'] or '-'} | {s['scored']}/{s['target']} | "
+            f"{s['failed'] + s['failed_final']} | "
             f"{s['skipped'] + s['missing']} | {_pct(s['scer'])} | {ci} | {_pct(s['cer'])} | {_pct(s['wer'])} | "
             f"{_num(s['hangul_ratio'])} | {_sec(s['latency_p50_s'])} | {_sec(s['latency_p90_s'])} | "
             f"{_sec(s['first_partial_p50_s'])} | {_num(s['rtf_p50'], 3)} | {s['throttled']} | {s['cached']} | {cost} |")
@@ -250,6 +277,15 @@ def render_markdown(meta: dict, summary: list[dict], comparisons: list[dict], ro
     for s in sorted((s for s in summary if s["split"] != "all"), key=lambda s: (s["route"], s["split"])):
         ci = "-" if s["scer_ci_low"] is None else f"{_pct(s['scer_ci_low'])}–{_pct(s['scer_ci_high'])}"
         lines.append(f"| `{s['route']}` | {s['split']} | {s['scored']}/{s['target']} | {_pct(s['scer'])} | {ci} |")
+
+    lines += ["", "## 실행 상태", "",
+              "지연 통계는 이번 실행에서 실제로 요청한 결과만 사용한다. 캐시 결과와 시계 이상(절전·일시 중지) 구간의 결과는 "
+              "지연 통계에서 제외한다. 전송 지연은 실시간 경로가 오디오를 다 보내는 데 걸린 시간에서 클립 길이를 뺀 값이다.", "",
+              "| 경로 | 시도 | 429 | 최종 실패 | 지연 표본 | 지연 제외(시계 이상) | 지연 경고 | 전송 지연 p95 |",
+              "|---|---|---|---|---|---|---|---|"]
+    for s in overall:
+        lines.append(f"| `{s['route']}` | {s['attempts']} | {s['throttled']} | {s['failed_final']} | {s['latency_n']} | "
+                     f"{s['latency_invalid']} | {s['latency_flagged']} | {_sec(s['send_delay_p95_s'])} |")
 
     lines += ["", f"## 기준 경로 대비 차이(`{baseline}`)", ""]
     if comparisons:
@@ -274,7 +310,10 @@ def render_markdown(meta: dict, summary: list[dict], comparisons: list[dict], ro
             warnings.append(f"`{s['route']}`: 빈 출력 {s['empty']}건을 전부 삭제 오류로 채점했다.")
         if s["forced_commit"]:
             warnings.append(f"`{s['route']}`: VAD가 끝나지 않아 강제 commit한 발화가 {s['forced_commit']}건이다.")
-    failures = [r for r in rows if r["status"] in ("failed", "skipped", "missing")]
+        if s["latency_invalid"]:
+            warnings.append(f"`{s['route']}`: 시계 이상 구간의 결과 {s['latency_invalid']}건을 지연 통계에서 제외했다. "
+                            "정확도 채점에는 포함했다.")
+    failures = [r for r in rows if r["status"] in ("failed", "failed_final", "skipped", "missing")]
     if warnings:
         lines += ["", "## 확인 필요", ""] + [f"- {w}" for w in warnings]
     if failures:
@@ -302,7 +341,9 @@ def write_report(run_dir: Path, data_dir: Path, out_dir: Path, baseline: str = D
         "route", "baseline", "metric", "n_common", "baseline_rate", "route_rate", "delta", "ci_low", "ci_high",
         "p_value"])
     _write_csv(out_dir / "per_utterance.csv", _utterance_rows(rows))
-    (out_dir / "report.md").write_text(render_markdown(meta, summary, comparisons, rows, baseline), encoding="utf-8")
+    health = ledger_summary(run_dir)
+    (out_dir / "report.md").write_text(render_markdown(meta, summary, comparisons, rows, baseline, health),
+                                       encoding="utf-8")
     write_json(out_dir / "summary.json", {"run_id": meta["run_id"], "subset": meta["subset"], "baseline": baseline,
                                           "summary": summary, "comparisons": comparisons})
     return {"out_dir": str(out_dir), "summary": summary, "comparisons": comparisons}

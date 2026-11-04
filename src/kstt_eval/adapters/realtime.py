@@ -23,7 +23,7 @@ from typing import Any
 
 from ..audio import pcm_chunks, read_pcm16, silence_pcm16
 from ..auth import redact
-from ..types import AudioInput, PermanentError, Transcription, TransientError
+from ..types import AudioInput, NetworkError, PermanentError, Transcription, TransientError
 from .base import HttpAdapter, check_aoai_deployment, now, parse_retry_after, require
 
 PREFIX = "conversation.item.input_audio_transcription."
@@ -167,6 +167,10 @@ class RealtimeAdapter(HttpAdapter):
 
     def url(self) -> str:  # pragma: no cover - abstract
         raise NotImplementedError
+
+    def sent_audio_s(self, duration_s: float) -> float:
+        mode = self.params.get("mode", "commit")
+        return duration_s + float(self.params.get("trailing_silence_s", 1.0 if mode == "vad" else 0.0))
 
     def session_update(self) -> dict[str, Any]:  # pragma: no cover - abstract
         raise NotImplementedError
@@ -319,6 +323,8 @@ class RealtimeAdapter(HttpAdapter):
             return PermanentError(message, status=status)
         if isinstance(exc, ConnectionClosed):
             return TransientError(redact(f"connection closed: {exc}"), ambiguous=audio_started)
+        if isinstance(exc, (OSError, asyncio.TimeoutError)) and not audio_started:
+            return NetworkError(redact(f"{type(exc).__name__}: {exc}"))
         if isinstance(exc, (OSError, asyncio.TimeoutError)):
             return TransientError(redact(f"{type(exc).__name__}: {exc}"), ambiguous=audio_started)
         return TransientError(redact(f"{type(exc).__name__}: {exc}"), ambiguous=audio_started)

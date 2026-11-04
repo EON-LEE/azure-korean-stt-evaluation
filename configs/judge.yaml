@@ -1,0 +1,46 @@
+# LLM semantic judge settings for `kstt judge` (plan §15).
+#
+# Endpoints come from environment variables, usually set in configs/endpoints.env (git-ignored;
+# see configs/endpoints.env.example). Never write real endpoints or resource names here.
+#
+# Judge calls send reference transcripts and STT hypotheses (text only; no route or model names) to the
+# configured Azure OpenAI deployment. Live judge calls need approval. Use `--dry-run` to count calls first.
+# Authentication uses Microsoft Entra ID (`az login`); `api_key_env` is an optional fallback.
+#
+# Fields:
+#   endpoint               Azure OpenAI endpoint of the resource that hosts the deployment
+#   deployment             deployment name (part of the judgment cache key)
+#   model_version          model version of the deployment (part of the cache key; update when it changes)
+#   api_version            chat completions API version
+#   reasoning_effort       sent as `reasoning_effort` (part of the cache key); null omits the parameter
+#   max_completion_tokens  output limit including reasoning tokens
+#   concurrency            parallel requests (override with --concurrency)
+#   max_retries            retries for 429/408/5xx and network errors (Retry-After is honoured)
+#   schema_retries         extra attempts when a response fails schema validation; then `judge_error`
+#   timeout_s              request timeout
+# `temperature` is never sent.
+
+judges:
+  gpt-5-mini:
+    endpoint: ${KSTT_JUDGE_AOAI_ENDPOINT}
+    deployment: ${KSTT_JUDGE_MINI_DEPLOYMENT:-gpt-5-mini}
+    model_version: "2025-08-07"
+    api_version: "2025-04-01-preview"
+    reasoning_effort: low
+    max_completion_tokens: 2000
+    concurrency: 4
+    max_retries: 4
+    schema_retries: 2
+    timeout_s: 120
+
+  gpt-5.5:
+    endpoint: ${KSTT_JUDGE_AOAI_ENDPOINT}
+    deployment: ${KSTT_JUDGE_LARGE_DEPLOYMENT:-gpt-5.5}
+    model_version: "2026-04-24"
+    api_version: "2025-04-01-preview"
+    reasoning_effort: low
+    max_completion_tokens: 2000
+    concurrency: 4
+    max_retries: 4
+    schema_retries: 2
+    timeout_s: 120

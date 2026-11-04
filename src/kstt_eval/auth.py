@@ -16,6 +16,8 @@ import threading
 import time
 from typing import Any
 
+from .types import AuthError
+
 COGNITIVE_SCOPE = "https://cognitiveservices.azure.com/.default"
 
 _credential = None
@@ -55,7 +57,12 @@ def _get_access(scope: str) -> tuple[str, float]:
         hit = cached()
         if hit:
             return hit
-        tok = get_credential().get_token(scope)
+        try:
+            tok = get_credential().get_token(scope)
+        except ValueError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - any credential failure means the login must be renewed
+            raise AuthError(redact(f"token request failed: {type(exc).__name__}: {exc}")[:500]) from exc
         with _lock:
             _tokens[scope] = (tok.token, float(tok.expires_on))
             return _tokens[scope]
@@ -63,6 +70,13 @@ def _get_access(scope: str) -> tuple[str, float]:
 
 def get_token(scope: str = COGNITIVE_SCOPE) -> str:
     return _get_access(scope)[0]
+
+
+def refresh_token(scope: str = COGNITIVE_SCOPE) -> str:
+    """Drop the cached token for ``scope`` and request a new one. Raises :class:`AuthError` on failure."""
+    with _lock:
+        _tokens.pop(scope, None)
+    return get_token(scope)
 
 
 class CachedTokenCredential:

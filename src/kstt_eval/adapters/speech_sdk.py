@@ -12,7 +12,7 @@ from typing import Any
 
 from ..audio import pcm_chunks, read_pcm16
 from ..auth import cached_credential, redact
-from ..types import AudioInput, PermanentError, Transcription, TransientError
+from ..types import AudioInput, NetworkError, PermanentError, Transcription, TransientError
 from .base import HttpAdapter, check_get, now, require, speech_models_check_url
 
 _TRANSIENT_CODES = {"TooManyRequests", "ConnectionFailure", "ServiceTimeout", "ServiceError", "ServiceUnavailable"}
@@ -88,7 +88,7 @@ class SpeechSDKAdapter(HttpAdapter):
             t_connect = now()
             conn.open(True)
             if not connected.wait(connect_timeout):
-                raise TransientError(f"Speech SDK did not connect within {connect_timeout}s")
+                raise NetworkError(f"Speech SDK did not connect within {connect_timeout}s")
             connect_s = now() - t_connect
             rec.start_continuous_recognition_async().get()
             audio_started = True
@@ -112,6 +112,8 @@ class SpeechSDKAdapter(HttpAdapter):
         if errors:
             code, details = errors[0]
             message = f"Speech SDK canceled: {code} {details}"[:500]
+            if code == "ConnectionFailure" and not audio_started:
+                raise NetworkError(message, code=code)
             if code in _TRANSIENT_CODES:
                 raise TransientError(message, code=code, ambiguous=audio_started)
             raise PermanentError(message, code=code)

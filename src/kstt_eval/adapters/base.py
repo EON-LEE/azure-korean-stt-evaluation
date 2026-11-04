@@ -10,7 +10,7 @@ import httpx
 
 from ..auth import auth_headers, redact
 from ..config import ModelConfig
-from ..types import AudioInput, PermanentError, Transcription, TransientError
+from ..types import AudioInput, NetworkError, PermanentError, Transcription, TransientError
 
 # Bump when adapter request/parse behaviour changes so cached results are not reused.
 ADAPTER_VERSION = "1"
@@ -18,7 +18,7 @@ ADAPTER_VERSION = "1"
 # Params that change how a request is executed but not what is sent or returned.
 NON_SIGNATURE_PARAMS = frozenset({
     "timeout_s", "max_retries", "concurrency", "retry_ambiguous", "api_key_env", "auth_scope",
-    "final_timeout_s", "connect_timeout_s", "min_interval_s",
+    "final_timeout_s", "connect_timeout_s", "min_interval_s", "max_attempts", "resource",
 })
 
 
@@ -50,6 +50,10 @@ class Adapter:
 
     async def transcribe(self, audio: AudioInput) -> Transcription:  # pragma: no cover - abstract
         raise NotImplementedError
+
+    def sent_audio_s(self, duration_s: float) -> float:
+        """Seconds of audio one attempt sends. Used for the audio-hour budget."""
+        return duration_s
 
     async def doctor(self, ws: bool = False) -> list[dict[str, Any]]:
         """Non-billable readiness checks. Each check is ``{"name", "ok", "detail"}``."""
@@ -127,7 +131,7 @@ class HttpAdapter(Adapter):
         try:
             resp = await self.client.request(method, url, **kwargs)
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
-            raise TransientError(redact(f"{type(exc).__name__}: {exc}")) from exc
+            raise NetworkError(redact(f"{type(exc).__name__}: {exc}")) from exc
         except httpx.HTTPError as exc:
             # Read/write timeouts and dropped connections happen after the audio was sent.
             raise TransientError(redact(f"{type(exc).__name__}: {exc}"), ambiguous=True) from exc

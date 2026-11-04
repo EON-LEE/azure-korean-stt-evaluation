@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 import time
 from pathlib import Path
@@ -12,10 +13,14 @@ from .adapters import create_adapter
 from .auth import get_token, redact
 from .config import load_env_file, load_experiments, load_models, select_routes
 from .data import SPLITS, DataError, load_manifest, prepare
+from .judge import add_judge_parser
 from .report import DEFAULT_BASELINE, write_report
-from .runner import RunError, RunPlan, execute, plan_summary
+from .runner import DEFAULT_MAX_ATTEMPTS, DEFAULT_SEED, LockHeld, RunError, RunPlan, execute, items_hash, \
+    plan_summary, select_entries, verify_audio
+from .supervisor import DEFAULT_COOLDOWNS_S, EXIT_INCOMPLETE, EXIT_LOCKED, EXIT_STOPPED, render_status, run_status, \
+    supervise
 from .types import ConfigError
-from .util import new_run_id
+from .util import CorruptLogError, git_info, new_run_id
 
 
 def log(msg: str) -> None:
@@ -95,36 +100,99 @@ def _print_plan(rows: list[dict], max_hours: float | None) -> None:
           f"{'none' if max_hours is None else f'{max_hours} h'}")
 
 
-def cmd_run(args: argparse.Namespace) -> int:
-    if args.subset == "full" and args.max_audio_hours is None and not args.dry_run:
+def _resource_limits(values: list[str] | None) -> dict[str, int]:
+    limits = {}
+    for v in values or []:
+        name, sep, n = v.partition("=")
+        if not sep or not name.strip() or not n.strip().isdigit() or int(n) < 1:
+            raise ConfigError(f"--resource-limit expects NAME=N with N >= 1, got {v!r}")
+        limits[name.strip()] = int(n)
+    return limits
+
+
+def _build_plan(args: argparse.Namespace, dry_run: bool = False) -> tuple[RunPlan, dict[str, list[str]]]:
+    """Validate run options and build the plan. Without ``dry_run`` also check routes, git state and audio."""
+    if args.subset == "full" and args.max_audio_hours is None and not dry_run:
         raise ConfigError("--subset full needs --max-audio-hours (shared budget across routes). "
-                          "Use --dry-run to see the required audio hours.")
+                          "Use `run --dry-run` to see the required audio hours.")
     routes = select_routes(_load_models(args), args.routes)
     not_ready = {m.key: sorted(m.missing_env) for m in routes if not m.ready}
-    if not_ready and not args.dry_run:
+    if not_ready and not dry_run:
         raise ConfigError(f"routes with missing env vars: {not_ready}. Fill {args.env_file}.")
-    entries = load_manifest(args.data_dir, args.subset)
-    if args.limit is not None:
-        entries = entries[:args.limit]
+    if args.limit is not None and args.sample_per_split is not None:
+        raise ConfigError("use either --limit or --sample-per-split, not both")
+    entries = select_entries(load_manifest(args.data_dir, args.subset), args.seed, args.limit, args.sample_per_split)
     if not entries:
         raise ConfigError("no manifest entries selected")
+    if not dry_run:
+        if args.subset == "full" and not args.allow_dirty and git_info().get("dirty"):
+            raise ConfigError("the git working tree has uncommitted changes. Commit them so results map to one "
+                              "commit, or pass --allow-dirty.")
+        if not args.no_verify_audio:
+            log(f"verifying audio sha256 for {len(entries)} item(s)")
+            problems = verify_audio(entries, args.data_dir)
+            if problems:
+                raise DataError(f"{len(problems)} audio file(s) do not match the manifest, e.g. {problems[:3]}. "
+                                "Run prepare-data again.")
+    selection = {"seed": args.seed, "limit": args.limit, "sample_per_split": args.sample_per_split,
+                 "items_sha256": items_hash(entries)}
     plan = RunPlan(run_id=args.run_id or new_run_id(args.subset), runs_dir=args.runs_dir, data_dir=args.data_dir,
                    subset=args.subset, routes=routes, entries=entries, max_audio_hours=args.max_audio_hours,
-                   experiment=args.experiment, parallel_routes=args.parallel_routes, use_cache=not args.no_cache)
+                   experiment=args.experiment, parallel_routes=args.parallel_routes, use_cache=not args.no_cache,
+                   extra={"selection": selection}, seed=args.seed, max_attempts=args.max_attempts,
+                   resource_limits=_resource_limits(args.resource_limit))
+    return plan, not_ready
+
+
+def _write_report(args: argparse.Namespace, plan: RunPlan) -> None:
+    if args.no_report:
+        return
+    out = write_report(plan.run_dir, args.data_dir, args.reports_dir / plan.run_id, baseline=args.baseline)
+    log(f"report: {Path(out['out_dir']) / 'report.md'}")
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    plan, not_ready = _build_plan(args, dry_run=args.dry_run)
     if args.dry_run:
-        print(f"run_id={plan.run_id} subset={plan.subset} items={len(entries)} routes={len(routes)} (dry run)")
+        print(f"run_id={plan.run_id} subset={plan.subset} items={len(plan.entries)} routes={len(plan.routes)} "
+              f"(dry run)")
         if not_ready:
             print(f"not ready (missing env): {not_ready}")
         _print_plan(plan_summary(plan), args.max_audio_hours)
         return 0
-    log(f"run_id={plan.run_id} subset={plan.subset} items={len(entries)} routes={len(routes)}")
+    log(f"run_id={plan.run_id} subset={plan.subset} items={len(plan.entries)} routes={len(plan.routes)}")
     outcome = asyncio.run(execute(plan, log=log))
-    log(f"budget used: {outcome['budget_used_audio_hours']:.4f} audio h; run dir: {outcome['run_dir']}")
+    log(f"audio sent this invocation: {outcome['budget_used_audio_hours']:.4f} h; run total "
+        f"{outcome['ledger_audio_hours']:.4f} h; run dir: {outcome['run_dir']}")
     for route, counts in outcome["counts"].items():
-        log(f"  {route}: {counts or 'already complete'}")
-    if not args.no_report:
-        out = write_report(plan.run_dir, args.data_dir, args.reports_dir / plan.run_id, baseline=args.baseline)
-        log(f"report: {Path(out['out_dir']) / 'report.md'}")
+        log(f"  {route}: {counts or 'nothing to do'}")
+    if outcome["blocked_routes"]:
+        log(f"blocked routes: {outcome['blocked_routes']}")
+    _write_report(args, plan)
+    if outcome["stopped"]:
+        return EXIT_STOPPED
+    if outcome["budget_exhausted"] or outcome["blocked_routes"]:
+        return EXIT_INCOMPLETE
+    return 0
+
+
+def cmd_supervise(args: argparse.Namespace) -> int:
+    if not args.run_id:
+        raise ConfigError("supervise needs --run-id so a restart resumes the same run")
+    try:
+        cooldowns = tuple(float(x) for x in args.cooldowns.split(",") if x.strip())
+    except ValueError as exc:
+        raise ConfigError(f"--cooldowns expects comma-separated seconds: {exc}") from None
+    plan, _ = _build_plan(args)
+    log(f"supervise run_id={plan.run_id} subset={plan.subset} items={len(plan.entries)} routes={len(plan.routes)} "
+        f"budget={plan.max_audio_hours} h")
+    return supervise(plan, log, cooldowns_s=cooldowns, max_idle_passes=args.max_idle_passes,
+                     on_finish=lambda p: _write_report(args, p), stay_awake=not args.no_keep_awake)
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    st = run_status(args.runs_dir / args.run)
+    print(json.dumps(st, ensure_ascii=False, indent=2) if args.json else render_status(st))
     return 0
 
 
@@ -164,25 +232,53 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--allow-revision-drift", action="store_true")
     s.set_defaults(func=cmd_prepare)
 
-    s = sub.add_parser("run", help="transcribe with the selected routes, then write the report")
-    s.add_argument("--routes", default="all", help="keys, globs, 'all' or 'track:A|B' (comma-separated)")
-    s.add_argument("--subset", choices=("smoke", "partial", "full"), default="smoke")
-    s.add_argument("--limit", type=int, help="first N manifest entries")
-    s.add_argument("--run-id")
-    s.add_argument("--max-audio-hours", type=float, help="shared budget for all attempts on all routes")
-    s.add_argument("--parallel-routes", type=int, default=2)
-    s.add_argument("--no-cache", action="store_true")
+    s = sub.add_parser("run", help="one pass over the selected routes, then write the report")
+    _add_run_args(s)
     s.add_argument("--dry-run", action="store_true", help="print the work plan without calling Azure")
-    s.add_argument("--no-report", action="store_true")
-    s.add_argument("--baseline", default=DEFAULT_BASELINE)
     s.set_defaults(func=cmd_run)
+
+    s = sub.add_parser("supervise", help="repeat passes until every item is final (long unattended runs)")
+    _add_run_args(s)
+    s.add_argument("--cooldowns", default=",".join(f"{c:.0f}" for c in DEFAULT_COOLDOWNS_S),
+                   help="seconds to wait between passes; grows while passes make no progress")
+    s.add_argument("--max-idle-passes", type=int, default=2, help="stop after N passes without progress")
+    s.add_argument("--no-keep-awake", action="store_true", help="do not ask Windows to stay awake")
+    s.set_defaults(func=cmd_supervise)
+
+    s = sub.add_parser("status", help="show the state of a run (read-only)")
+    s.add_argument("--run", required=True, help="run id under --runs-dir")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_status)
 
     s = sub.add_parser("report", help="rebuild the report for a run")
     s.add_argument("--run", required=True, help="run id under --runs-dir")
     s.add_argument("--baseline", default=DEFAULT_BASELINE)
     s.add_argument("--n-boot", type=int, default=1000)
     s.set_defaults(func=cmd_report)
+
+    add_judge_parser(sub)
     return p
+
+
+def _add_run_args(s: argparse.ArgumentParser) -> None:
+    s.add_argument("--routes", default="all", help="keys, globs, 'all' or 'track:A|B' (comma-separated)")
+    s.add_argument("--subset", choices=("smoke", "partial", "full"), default="smoke")
+    s.add_argument("--limit", type=int, help="first N items in seed order")
+    s.add_argument("--sample-per-split", type=int, help="first N items of each split in seed order")
+    s.add_argument("--seed", default=DEFAULT_SEED, help="item order and sampling seed")
+    s.add_argument("--run-id")
+    s.add_argument("--max-audio-hours", type=float,
+                   help="audio-hour budget for all attempts on all routes, cumulative across invocations")
+    s.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS,
+                   help="sends per item that reached the model before the item is final")
+    s.add_argument("--parallel-routes", type=int, default=0, help="routes running at once (0 = all)")
+    s.add_argument("--resource-limit", action="append", metavar="NAME=N",
+                   help="max concurrent requests on one Azure resource (repeatable)")
+    s.add_argument("--no-cache", action="store_true")
+    s.add_argument("--allow-dirty", action="store_true", help="allow --subset full with uncommitted changes")
+    s.add_argument("--no-verify-audio", action="store_true", help="skip the audio sha256 check before sending")
+    s.add_argument("--no-report", action="store_true")
+    s.add_argument("--baseline", default=DEFAULT_BASELINE)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -195,11 +291,17 @@ def main(argv: list[str] | None = None) -> int:
         if loaded:
             log(f"loaded {len(loaded)} variable(s) from {args.env_file}")
         return args.func(args)
+    except LockHeld as exc:
+        print(f"error: {redact(exc)}", file=sys.stderr)
+        return EXIT_LOCKED
+    except CorruptLogError as exc:
+        print(f"error: {redact(exc)}\n       Fix or move the damaged line by hand, then resume.", file=sys.stderr)
+        return 2
     except (ConfigError, DataError, RunError, FileNotFoundError) as exc:
         print(f"error: {redact(exc)}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        print("interrupted; re-run the same command with --run-id to resume", file=sys.stderr)
+        print("interrupted; run the same command with the same --run-id to resume", file=sys.stderr)
         return 130
 
 

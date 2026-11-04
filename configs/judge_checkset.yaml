@@ -1,0 +1,130 @@
+# Judge check set for `kstt judge --checkset configs/judge_checkset.yaml` (plan §15.7 step 2).
+#
+# 20 hand-written pairs with clear expected labels. They are not taken from KsponSpeech or any other
+# dataset, and they differ from the few-shot examples in the judge prompt.
+# Every pair is sent to the judge model; rule judgments are not applied, so the model itself is checked.
+# All 20 must match before judging STT results. Re-run whenever the judge model or prompt changes.
+#
+# Fields: id, category (informational), reference, hypothesis, expected (preserved | partial | lost).
+
+version: checkset-v1
+pairs:
+  - id: cs01
+    category: filler
+    reference: "어 저는 커피 말고 녹차 마실게요"
+    hypothesis: "저는 커피 말고 녹차 마실게요"
+    expected: preserved
+
+  - id: cs02
+    category: filler
+    reference: "음 이번 주말에는 그냥 집에서 쉬려고"
+    hypothesis: "이번 주말에는 그냥 집에서 쉬려고"
+    expected: preserved
+
+  - id: cs03
+    category: number_format
+    reference: "월세가 30만 원이야"
+    hypothesis: "월세가 삼십만 원이야"
+    expected: preserved
+
+  - id: cs04
+    category: number_format
+    reference: "버스가 15분마다 와요"
+    hypothesis: "버스가 십오 분마다 와요"
+    expected: preserved
+
+  - id: cs05
+    category: spacing
+    reference: "그거 진짜 맛있더라"
+    hypothesis: "그거진짜 맛있더라"
+    expected: preserved
+
+  - id: cs06
+    category: punctuation
+    reference: "내일 비 온대 우산 챙겨"
+    hypothesis: "내일 비 온대. 우산 챙겨!"
+    expected: preserved
+
+  - id: cs07
+    category: colloquial_spelling
+    reference: "그러니까 내 말은 그게 아니라고"
+    hypothesis: "그니까 내 말은 그게 아니라고"
+    expected: preserved
+
+  - id: cs08
+    category: english_spelling
+    reference: "오늘 회의는 줌으로 해요"
+    hypothesis: "오늘 회의는 Zoom으로 해요"
+    expected: preserved
+
+  - id: cs09
+    category: filler_and_number_format
+    reference: "아 그 모임 7시에 시작해"
+    hypothesis: "그 모임 일곱 시에 시작해"
+    expected: preserved
+
+  - id: cs10
+    category: negation
+    reference: "나 숙제 안 했어"
+    hypothesis: "나 숙제 했어"
+    expected: lost
+
+  - id: cs11
+    category: negation
+    reference: "거기는 주차할 데가 없어요"
+    hypothesis: "거기는 주차할 데가 있어요"
+    expected: lost
+
+  - id: cs12
+    category: number_value
+    reference: "시험은 25일에 봐"
+    hypothesis: "시험은 26일에 봐"
+    expected: lost
+
+  - id: cs13
+    category: number_value
+    reference: "택시비가 만 이천 원 나왔어"
+    hypothesis: "택시비가 만 칠천 원 나왔어"
+    expected: lost
+
+  - id: cs14
+    category: unrelated
+    reference: "점심은 회사 앞 국밥집에서 먹자"
+    hypothesis: "강아지가 공원에서 공을 쫓아갔다"
+    expected: lost
+
+  - id: cs15
+    category: wrong_language
+    reference: "오늘 날씨가 정말 좋네요"
+    hypothesis: "The weather is really nice today."
+    expected: lost
+
+  - id: cs16
+    category: wrong_language
+    reference: "다음 주에 이사 가요"
+    hypothesis: "daeum jue isa gayo"
+    expected: lost
+
+  - id: cs17
+    category: substitution
+    reference: "창문 좀 닫아 줄래?"
+    hypothesis: "창문 좀 열어 줄래?"
+    expected: lost
+
+  - id: cs18
+    category: named_entity
+    reference: "이번 휴가는 강릉으로 가기로 했어"
+    hypothesis: "이번 휴가는 광주로 가기로 했어"
+    expected: lost
+
+  - id: cs19
+    category: side_info_deletion
+    reference: "어제 친구랑 홍대에서 늦게까지 놀았어"
+    hypothesis: "어제 홍대에서 늦게까지 놀았어"
+    expected: partial
+
+  - id: cs20
+    category: side_info_deletion
+    reference: "아침에 일어나서 따뜻한 물 한 잔 마셨어"
+    hypothesis: "아침에 일어나서 물 한 잔 마셨어"
+    expected: partial
